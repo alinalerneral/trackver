@@ -1,0 +1,32 @@
+# Conda environment for trackver.
+#
+#     conda env create -f environment.yml
+#     conda activate trackver
+#
+# mamba and micromamba read the same file and solve faster.
+
+name: trackver
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python >=3.10
+
+  # reading the ECMWF BUFR tropical cyclone track files from S3
+  # (eccodes, the BUFR decoder underneath, comes in as a dependency)
+  - earthkit-data >=1.0     # S3 source, FeatureList
+  - pdbufr >=0.13           # used by to_pandas() to flatten BUFR into a dataframe
+
+  # analysis and plotting
+  - numpy
+  - pandas
+  - matplotlib-base >=3.6   # the meteogram uses layout="constrained"
+  - cartopy >=0.22          # the track map and its coastlines
+
+  # downloading the IBTrACS observations
+  - wget
+
+  # running trackver.ipynb (not needed for the ./trackver command)
+  - jupyterlab
+  - ipykernel

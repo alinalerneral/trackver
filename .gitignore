@@ -1,0 +1,10 @@
+# IBTrACS CSV downloaded by trackver (about 10 MB, refreshed on every run)
+obs/
+
+# plots written by trackver
+plots/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store

@@ -1,0 +1,11 @@
+# pip alternative to environment.yml; wget must also be on the PATH.
+earthkit-data>=1.0
+pdbufr>=0.13
+numpy
+pandas
+matplotlib>=3.6
+cartopy>=0.22
+
+# only for trackver.ipynb
+jupyterlab
+ipykernel

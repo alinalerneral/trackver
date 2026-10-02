@@ -20,7 +20,7 @@ positions at the forecast steps.
 ## Installation
 
 ```
-git clone <this repository>
+git clone https://github.com/alinalerneral/trackver.git
 cd trackver
 conda env create -f environment.yml      # or mamba / micromamba
 conda activate trackver

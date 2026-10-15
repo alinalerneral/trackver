@@ -1,4 +1,6 @@
-# Conda environment for trackver.
+# Conda environment for trackver and trackver_mars.
+#
+# trackver_mars also needs the mars command on the PATH (it is on ECMWF's Atos HPC).
 #
 #     conda env create -f environment.yml
 #     conda activate trackver
@@ -13,9 +15,9 @@ channels:
 dependencies:
   - python >=3.10
 
-  # reading the ECMWF BUFR tropical cyclone track files from S3
+  # reading the ECMWF BUFR tropical cyclone track files (from S3 or MARS)
   # (eccodes, the BUFR decoder underneath, comes in as a dependency)
-  - earthkit-data >=1.0     # S3 source, FeatureList
+  - earthkit-data >=1.0     # S3 and file sources, FeatureList
   - pdbufr >=0.13           # used by to_pandas() to flatten BUFR into a dataframe
 
   # analysis and plotting
@@ -27,6 +29,6 @@ dependencies:
   # downloading the IBTrACS observations
   - wget
 
-  # running trackver.ipynb (not needed for the ./trackver command)
+  # running the notebooks (not needed for the ./trackver and ./trackver_mars commands)
   - jupyterlab
   - ipykernel

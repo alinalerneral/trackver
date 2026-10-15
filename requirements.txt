@@ -1,4 +1,5 @@
-# pip alternative to environment.yml; wget must also be on the PATH.
+# pip alternative to environment.yml; wget must also be on the PATH
+# (and mars, for trackver_mars).
 earthkit-data>=1.0
 pdbufr>=0.13
 numpy
@@ -6,6 +7,6 @@ pandas
 matplotlib>=3.6
 cartopy>=0.22
 
-# only for trackver.ipynb
+# only for the notebooks
 jupyterlab
 ipykernel

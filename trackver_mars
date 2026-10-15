@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Verify the ECMWF IFS and AIFS ensemble tropical cyclone forecasts against IBTrACS.
+
+    ./trackver_mars <STORMNAME>          e.g.  ./trackver_mars DUJUAN
+    ./trackver_mars <IBTrACS SID>        e.g.  ./trackver_mars 2026259N15149
+
+The program
+  1. downloads the latest IBTrACS "last3years" CSV from NCEI (newest version found),
+  2. finds when the storm was observed and lists the ECMWF ensemble runs that
+     started during that time,
+  3. asks which run to use and retrieves its BUFR track files from MARS: the IFS
+     ensemble always, and the AIFS ensemble too for runs from AIFS_FROM on,
+  4. plots, for each model, the wind and pressure meteograms of the ensemble with the
+     observed value at every forecast step, and a map of the ensemble track plumes
+     with the observed positions, saves the figures in plots/ and shows them.
+
+This is the MARS mode of trackver, so it needs the mars command (ECMWF's Atos HPC or
+a workstation with MARS access). The code both modes share (observations, tracks,
+plots) is in trackverlib.py.
+"""
+
+import subprocess
+import sys
+from datetime import datetime
+
+from trackverlib import (HERE, MODEL_NAMES, TrackverError, command_line, find_storm,
+                         make_plots, observations, pick_run, runs_during, save_and_show,
+                         share_limits)
+# used by trackver_mars.ipynb through this module
+from trackverlib import choose_storm, download_ibtracs, observed_intensity, plt, read_ibtracs
+
+try:
+    import earthkit.data as ekd
+except ImportError as error:
+    sys.exit(f"trackver_mars: {error}\nInstall earthkit-data >= 1.0 and pdbufr "
+             "(see environment.yml).")
+
+
+FORECAST_DIR = HERE / "forecasts"            # BUFR track files from MARS, kept for re-runs
+
+# MARS keys of the ensemble tropical cyclone tracks of each model; date and time are added
+MARS_KEYS = {
+    "ifs": {"class": "od", "expver": "1", "obstype": "32", "stream": "enfo", "type": "tf"},
+    "aifs": {"class": "ai", "expver": "1", "model": "aifs-ens", "obstype": "32",
+             "stream": "enfo", "type": "tf"},
+}
+AIFS_FROM = datetime(2026, 5, 12)            # first AIFS ensemble track file in MARS
+
+
+# ---------------------------------------------------------------------------
+# ECMWF forecast runs in MARS
+# ---------------------------------------------------------------------------
+
+def run_models(base):
+    """The models with a track file in MARS for a run: AIFS only from AIFS_FROM on."""
+    return ["ifs", "aifs"] if base >= AIFS_FROM else ["ifs"]
+
+
+def candidate_runs(track, obs):
+    """Runs that started while the storm was observed (every 6 hours).
+
+    MARS is not asked which runs it has: that takes as long as retrieving one. A run
+    without a track file is reported when it is retrieved.
+    """
+    return runs_during(track, obs)
+
+
+def mars_request(model, base, target):
+    """Text of the MARS request for one model's track file of one run."""
+    keys = {**MARS_KEYS[model], "date": f"{base:%Y-%m-%d}", "time": f"{base:%H}:00:00",
+            "target": f'"{target}"'}
+    return "retrieve,\n" + ",\n".join(f"    {k}={v}" for k, v in keys.items()) + "\n"
+
+
+def retrieve(base, models):
+    """Retrieve the track files of one run from MARS, all models at the same time.
+
+    Files retrieved earlier are reused. Returns {model: path} for the files that came
+    back; a model MARS had nothing for is reported and left out.
+    """
+    FORECAST_DIR.mkdir(exist_ok=True)
+    paths, running = {}, {}
+    for model in models:
+        path = FORECAST_DIR / f"{model}_enfo_tf_{base:%Y%m%d%H}.bufr"
+        if path.exists() and path.stat().st_size:
+            print(f"{MODEL_NAMES[model]}: using {path.name}, retrieved earlier")
+            paths[model] = path
+            continue
+        # into a .part file first, so an interrupted retrieval is never taken as complete
+        part, request, log = (path.with_suffix(s) for s in (".part", ".req", ".log"))
+        part.unlink(missing_ok=True)
+        request.write_text(mars_request(model, base, part))
+        try:
+            with open(log, "w") as out:
+                job = subprocess.Popen(["mars", str(request)], stdout=out,
+                                       stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            raise TrackverError("the mars command is not on the PATH; trackver_mars needs "
+                                "MARS access (e.g. on ECMWF's Atos HPC)")
+        running[model] = job, path, part, log
+
+    if running:
+        print(f"\nRetrieving the {base:%Y-%m-%d %H} UTC run from MARS "
+              f"({', '.join(MODEL_NAMES[m] for m in running)}); this takes from seconds to "
+              "many minutes, depending on how busy MARS is ...")
+    try:
+        for model, (job, path, part, log) in running.items():
+            job.wait()
+            if job.returncode == 0 and part.exists() and part.stat().st_size:
+                part.rename(path)
+                paths[model] = path
+                print(f"{MODEL_NAMES[model]}: retrieved {path.name}")
+                continue
+            part.unlink(missing_ok=True)
+            errors = [line for line in log.read_text(errors="replace").splitlines()
+                      if " ERROR " in line or " FATAL " in line]
+            print(f"warning: MARS returned no {MODEL_NAMES[model]} track file for "
+                  f"{base:%Y-%m-%d %H} UTC" + (f": {errors[-1].strip()}" if errors else "")
+                  + f" (log in {log})")
+    except KeyboardInterrupt:
+        for job, *_ in running.values():
+            job.terminate()
+        sys.exit("\ntrackver_mars: cancelled")
+    return {m: paths[m] for m in models if m in paths}
+
+
+def forecast_storms(base, track, models=None):
+    """Retrieve one run from MARS and return {model: messages of the storm in it}."""
+    name = track.NAME.iloc[0]
+    paths = retrieve(base, models or run_models(base))
+    if not paths:
+        raise TrackverError(f"MARS has no ensemble track file for {base:%Y-%m-%d %H} UTC; "
+                            "try another run")
+
+    here = track.iloc[(track.time - base).abs().argmin()]     # observed centre at the base time
+    storms = {}
+    for model, path in paths.items():
+        fl = ekd.from_source("file", str(path)).to_featurelist()
+        found, how = find_storm(fl, name, here.LAT, here.LON)
+        if found:
+            print(f"Found {name} in the {MODEL_NAMES[model]} forecast {how}.")
+            storms[model] = fl[found]
+        else:
+            print(f"warning: {name} is not in the {MODEL_NAMES[model]} forecast file")
+    if not storms:
+        raise TrackverError(
+            f"{name} is not in the {base:%Y-%m-%d %H} UTC forecast files. The forecast only "
+            "tracks storms that were analysed at its start, which early, weak stages "
+            "often are not; try a later run.")
+    return storms
+
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    args = command_line("Plot ECMWF IFS and AIFS ensemble wind and pressure meteograms and "
+                        "track plumes for a tropical cyclone, verified against IBTrACS "
+                        "observations, with the forecasts from MARS.", "DUJUAN")
+    try:
+        track, obs, obs_label = observations(args)
+        bases = candidate_runs(track, obs)
+        note = (f"AIFS ensemble tracks are in MARS from {AIFS_FROM:%Y-%m-%d} only; "
+                "earlier runs are plotted for IFS alone." if bases[0] < AIFS_FROM else "")
+        base = pick_run(args, track, obs, bases, run_models, note)
+        if base < AIFS_FROM:
+            print(f"\nNo AIFS ensemble tracks in MARS before {AIFS_FROM:%Y-%m-%d}; "
+                  "plotting IFS only.")
+        storms = forecast_storms(base, track)
+    except TrackverError as error:
+        sys.exit(f"trackver_mars: {error}")
+
+    figures = {model: make_plots(storm, track, base, obs, obs_label, args.max_hours, model)
+               for model, storm in storms.items()}
+    share_limits(list(figures.values()))
+    save_and_show(figures, track, base, args)
+
+
+if __name__ == "__main__":
+    main()

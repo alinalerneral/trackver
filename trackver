@@ -13,242 +13,36 @@ The program
      value at every forecast step, and a map of the ensemble track plumes with the
      observed positions, saves both figures in plots/ and shows them.
 
-The plotting follows the track map and the lower two intensity panels of the ECMWF
-"Tropical Cyclone Garance showcase" notebook.
+This is the S3 mode, which needs no ECMWF account. trackver_mars, next to it, takes
+the forecasts from MARS instead and adds the AIFS ensemble. The code both share
+(observations, tracks, plots) is in trackverlib.py.
 """
 
-import argparse
-import re
-import subprocess
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import timedelta
+
+from trackverlib import (TrackverError, command_line, find_storm, make_plots, observations,
+                         pick_run, run_hours, runs_during, save_and_show)
+# used by trackver.ipynb through this module
+from trackverlib import choose_storm, download_ibtracs, observed_intensity, plt, read_ibtracs
 
 try:
-    import cartopy.crs as ccrs
-    import cartopy.feature as cfeature
     import earthkit.data as ekd
-    import matplotlib
-    import matplotlib.dates as mdates
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
-    from matplotlib.collections import LineCollection
-    from matplotlib.lines import Line2D
-    from matplotlib.ticker import MultipleLocator
 except ImportError as error:
-    sys.exit(f"trackver: {error}\nInstall earthkit-data >= 1.0, pdbufr, pandas, matplotlib "
-             "and cartopy (see environment.yml).")
+    sys.exit(f"trackver: {error}\nInstall earthkit-data >= 1.0 and pdbufr "
+             "(see environment.yml).")
 
 
-HERE = Path(__file__).resolve().parent
-OBS_DIR = HERE / "obs"                       # where the IBTrACS CSV is kept
-PLOT_DIR = HERE / "plots"                    # where the figures are saved
-
-IBTRACS_ROOT = ("https://www.ncei.noaa.gov/data/"
-                "international-best-track-archive-for-climate-stewardship-ibtracs/")
 S3_ENDPOINT = "s3.eu-central-1.amazonaws.com"
 S3_BUCKET = "ecmwf-static-datasets"
 S3_PREFIX = "tropical-cyclone-tracks"
 
-STEP_HOURS = 6                                  # the BUFR file stores the track every 6 hours
-CENTRE, MAXWIND, PERTURBED_ANALYSIS = 1, 3, 4   # meteorologicalAttributeSignificance
-HRES, CONTROL = 0, 1                            # ensembleForecastType
-MS_TO_KT = 1.94384
-MATCH_DISTANCE = 5.0     # degrees; how far the analysed centre may be from the observed one
-JOIN_HOURS, JOIN_DISTANCE = 48, 10.0   # when a new SID of the same name continues a storm
-
-
-class TrackverError(Exception):
-    """Something the user can act on, e.g. a storm that is not in the file."""
-
-
-# wind averaging period of each WMO agency, from the IBTrACS column documentation
-AVERAGING = {"hurdat_atl": "1-min", "hurdat_epa": "1-min", "atcf": "1-min", "cphc": "1-min",
-             "tokyo": "10-min", "newdelhi": "3-min", "reunion": "10-min", "bom": "10-min",
-             "nadi": "10-min", "wellington": "10-min"}
-
 
 # ---------------------------------------------------------------------------
-# 1. IBTrACS observations
+# ECMWF forecast runs on S3
 # ---------------------------------------------------------------------------
-
-def wget_text(url):
-    """Contents of a web page, fetched with wget."""
-    done = subprocess.run(["wget", "-q", "-O", "-", url], capture_output=True, text=True,
-                          timeout=120)
-    if done.returncode:
-        raise RuntimeError(f"wget could not read {url}")
-    return done.stdout
-
-
-def latest_ibtracs_url():
-    """URL of the newest IBTrACS 'last3years' CSV, whatever the version is called."""
-    versions = set(re.findall(r'href="(v\d+r\d+)/?"', wget_text(IBTRACS_ROOT)))
-    if not versions:
-        raise RuntimeError(f"no IBTrACS version directory found under {IBTRACS_ROOT}")
-    key = lambda v: tuple(int(n) for n in re.findall(r"\d+", v))
-    for version in sorted(versions, key=key, reverse=True):
-        folder = f"{IBTRACS_ROOT}{version}/access/csv/"
-        try:
-            names = re.findall(r'href="(ibtracs\.last3years\.list\.[^"/]+\.csv)"',
-                               wget_text(folder))
-        except RuntimeError:
-            continue
-        if names:
-            return folder + sorted(names)[-1]
-    raise RuntimeError("no ibtracs.last3years CSV found in any IBTrACS version")
-
-
-def download_ibtracs():
-    """Download the latest 'last3years' CSV (only if it changed) and return its path."""
-    OBS_DIR.mkdir(exist_ok=True)
-    try:
-        url = latest_ibtracs_url()
-        print(f"IBTrACS: {url}")
-        subprocess.run(["wget", "-q", "--show-progress", "-N", "-P", str(OBS_DIR), url],
-                       check=True, timeout=1800)
-        return OBS_DIR / url.rsplit("/", 1)[1]
-    except (RuntimeError, subprocess.SubprocessError) as error:
-        local = sorted(OBS_DIR.glob("ibtracs.last3years.list.*.csv"),
-                       key=lambda p: p.stat().st_mtime)
-        if not local:
-            raise TrackverError(f"{error}, and there is no earlier copy in {OBS_DIR}")
-        print(f"warning: {error}; using the earlier copy {local[-1].name}")
-        return local[-1]
-
-
-def read_ibtracs(path):
-    """The columns we need from the IBTrACS CSV, one row per storm and time."""
-    columns = ["SID", "SEASON", "BASIN", "NAME", "ISO_TIME", "LAT", "LON", "WMO_WIND",
-               "WMO_PRES", "WMO_AGENCY", "TRACK_TYPE", "LANDFALL", "USA_AGENCY",
-               "USA_WIND", "USA_PRES"]
-    # the second line holds units; blanks are missing; "NA" is the North Atlantic, not NaN
-    df = pd.read_csv(path, skiprows=[1], usecols=columns, keep_default_na=False,
-                     na_values=["", " "], low_memory=False)
-    df["time"] = pd.to_datetime(df.ISO_TIME)
-    return df.sort_values(["NAME", "time"], kind="stable").reset_index(drop=True)
-
-
-def degrees_apart(lat1, lon1, lat2, lon2):
-    """Rough distance in degrees of latitude, across the date line too."""
-    dlon = (lon2 - lon1 + 180) % 360 - 180
-    return float(np.hypot(lat2 - lat1, dlon * np.cos(np.radians((lat1 + lat2) / 2))))
-
-
-def join_pieces(rows):
-    """A storm key for every row: pieces of one storm under several SIDs share it.
-
-    IBTrACS sometimes splits a storm into two SIDs: RAE (2025) is 2025054S13182 up to
-    25 Feb 12 UTC and 2025057S25184 from 18 UTC, at nearly the same place. A SID with
-    the same name that starts within JOIN_HOURS and JOIN_DISTANCE of where an earlier
-    one ended continues that storm. Unnamed systems are never joined.
-    """
-    key, ends = {}, {}                      # SID -> storm key, storm key -> its last row
-    for sid, piece in rows.groupby("SID", sort=False):     # rows are in time order
-        first = piece.iloc[0]
-        storm = sid
-        for earlier, last in ends.items():
-            gap = (first.time - last.time).total_seconds() / 3600
-            if (first.NAME == last.NAME != "UNNAMED" and 0 < gap <= JOIN_HOURS
-                    and degrees_apart(last.LAT, last.LON, first.LAT, first.LON)
-                    <= JOIN_DISTANCE):
-                storm = earlier
-                break
-        key[sid] = storm
-        ends[storm] = piece.iloc[-1]
-    return rows.SID.map(key)
-
-
-def choose_storm(df, wanted, pick=None, ask=True, at=None):
-    """Rows of the one storm the user asked for, by name or by IBTrACS SID.
-
-    When several storms have the name, the one observed at the time `at` is used if
-    given; otherwise pick is its number in the printed list, and without pick the user
-    is asked, or with ask=False an error is raised.
-    """
-    wanted = wanted.strip().upper()
-    by_sid = df[df.SID == wanted]
-    name = by_sid.NAME.iloc[0] if len(by_sid) else wanted
-    rows = df[df.NAME.str.upper() == name.upper()]
-    rows = rows[~rows.TRACK_TYPE.str.contains("spur", case=False, na=False)]
-    if rows.empty:
-        raise TrackverError(f"no storm called {wanted} in the IBTrACS last-3-years file")
-    rows = rows.assign(storm=join_pieces(rows))
-
-    storms = (rows.groupby("storm")
-                  .agg(sids=("SID", lambda s: "+".join(s.unique())), basin=("BASIN", "first"),
-                       start=("time", "min"), end=("time", "max"),
-                       wind=("WMO_WIND", "max"), usa=("USA_WIND", "max"))
-                  .sort_values("start"))
-    if at is not None:
-        during = storms[(storms.start <= at) & (at <= storms.end)]
-        if len(during) != 1:
-            when = ", ".join(f"{s.start:%Y-%m-%d} to {s.end:%Y-%m-%d}" for s in storms.itertuples())
-            problem = ("was not observed" if during.empty else
-                       "names several storms observed")
-            raise TrackverError(f"{wanted} {problem} at {at:%Y-%m-%d %H} UTC "
-                                f"(observed {when})")
-        storm = during.index[0]
-    elif len(by_sid):
-        storm = rows.loc[rows.SID == wanted, "storm"].iloc[0]
-    elif len(storms) == 1:
-        storm = storms.index[0]
-    else:
-        print(f"\n{len(storms)} storms are called {wanted}:")
-        for n, s in enumerate(storms.itertuples(), 1):
-            peak = s.wind if pd.notna(s.wind) else s.usa
-            peak = f"peak {peak:.0f} kt" if pd.notna(peak) else "no wind reported"
-            print(f"  {n}  {s.sids}  basin {s.basin}  {s.start:%Y-%m-%d} to {s.end:%Y-%m-%d}"
-                  f"  {peak}")
-        if pick is None and not ask:
-            raise TrackverError(f"several storms are called {wanted}; "
-                                "choose one by its number in the list above")
-        if pick is None:
-            pick = ask_number("Which storm? ", len(storms))
-        elif not 1 <= pick <= len(storms):
-            raise TrackverError(f"choose a storm from 1 to {len(storms)}")
-        storm = storms.index[pick - 1]
-    track = rows[rows.storm == storm].sort_values("time", kind="stable")
-    track = track.drop_duplicates("time").reset_index(drop=True)
-    if track.SID.nunique() > 1:
-        print(f"{track.NAME.iloc[0]} is split over {track.SID.nunique()} IBTrACS SIDs "
-              f"({'+'.join(track.SID.unique())}); using them as one storm.")
-    return track
-
-
-def observed_intensity(track):
-    """Observed wind (kt) and pressure (hPa) by time, and a label for the source."""
-    if track.WMO_WIND.notna().any() or track.WMO_PRES.notna().any():
-        obs = track.rename(columns={"WMO_WIND": "wind", "WMO_PRES": "mslp"})
-        agencies = obs.loc[obs.wind.notna() | obs.mslp.notna(), "WMO_AGENCY"].dropna().unique()
-        label = ", ".join(f"{a} {AVERAGING.get(a, '')}".strip() for a in agencies)
-    else:
-        obs = track.rename(columns={"USA_WIND": "wind", "USA_PRES": "mslp"})
-        agencies = obs.loc[obs.wind.notna() | obs.mslp.notna(), "USA_AGENCY"].dropna().unique()
-        label = ", ".join(agencies) + " 1-min"
-    obs = obs.dropna(subset=["wind", "mslp"], how="all").drop_duplicates("time")
-    if obs.empty:
-        raise TrackverError(f"IBTrACS has no wind or pressure for {track.NAME.iloc[0]}")
-    return obs.set_index("time")[["wind", "mslp", "LAT", "LON"]], f"IBTrACS: {label}"
-
-
-def first_landfall(track):
-    """Time of the first landfall in the track (LANDFALL == 0 after being over sea), or None."""
-    over_sea = track.LANDFALL > 0
-    hits = track[(track.LANDFALL == 0) & over_sea.shift(fill_value=False)]
-    return hits.time.iloc[0] if len(hits) else None
-
-
-# ---------------------------------------------------------------------------
-# 2. ECMWF forecast runs on S3
-# ---------------------------------------------------------------------------
-
-def run_hours(base):
-    return 360 if base.hour in (0, 12) else 144     # the 00 and 12 UTC runs go further ahead
-
 
 def run_key(base):
     """S3 object key of the tropical cyclone track file of one ensemble run."""
@@ -284,8 +78,7 @@ def s3_keys(months):
 
 def candidate_runs(track, obs):
     """Runs that started while the storm was observed and whose file is on S3."""
-    first, last = obs.index.min().ceil("6h"), obs.index.max().floor("6h")
-    bases = [t.to_pydatetime() for t in pd.date_range(first, last, freq="6h")]
+    bases = runs_during(track, obs)
     keys = s3_keys(sorted({(b.year, b.month) for b in bases}))
     if keys is not None:
         bases = [b for b in bases if run_key(b) in keys]
@@ -293,291 +86,6 @@ def candidate_runs(track, obs):
         raise TrackverError(f"no ECMWF track file on S3 for the time "
                             f"{track.NAME.iloc[0]} was observed")
     return bases
-
-
-def print_runs(bases, obs, landfall, max_hours):
-    """Print the possible runs with what each can be verified against."""
-    print(f"\nThe storm was observed from {obs.index.min():%Y-%m-%d %H} to "
-          f"{obs.index.max():%Y-%m-%d %H} UTC"
-          + (f"; first landfall {landfall:%Y-%m-%d %H} UTC." if landfall else "."))
-    print("Forecast runs available:\n")
-    print("   #  base time (UTC)   range   observed up to   steps with obs"
-          + ("   landfall at" if landfall else ""))
-    for n, base in enumerate(bases, 1):
-        hours = min(run_hours(base), max_hours)
-        steps = [base + timedelta(hours=h) for h in range(0, hours + 1, STEP_HOURS)]
-        seen = obs.index.intersection(steps)
-        reach = int((seen.max() - base).total_seconds() // 3600) if len(seen) else 0
-        line = (f"  {n:>2}  {base:%Y-%m-%d %H}     {hours:>3} h   T+{reach:<3} h"
-                f"           {len(seen):>3}")
-        if landfall:
-            ahead = (landfall - base).total_seconds() / 3600
-            line += f"            T+{ahead:.0f} h" if 0 <= ahead <= hours else ""
-        print(line)
-
-
-def choose_run(bases, obs, landfall, max_hours):
-    """Print the possible runs and ask which one to use."""
-    print_runs(bases, obs, landfall, max_hours)
-    return bases[ask_number("\nWhich run (number)? ", len(bases)) - 1]
-
-
-def ask_number(prompt, top):
-    while True:
-        try:
-            answer = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit("\ntrackver: cancelled")
-        if answer.isdigit() and 1 <= int(answer) <= top:
-            return int(answer)
-        print(f"  please type a number from 1 to {top}")
-
-
-def find_storm(fl, name, lat, lon):
-    """Messages of the storm in the forecast file.
-
-    By name, when the analysed centre is also close to the observed one. Otherwise
-    (the file has the storm under another name, or only an identifier before it was
-    named, or the name belongs to another system) the analysed storm closest to the
-    observed position. A far-away name match is the last resort.
-    """
-    storms = []                                     # (index, name, distance)
-    for i, msg in enumerate(fl):
-        msg.unpack()
-        label = (msg.get("longStormName", default="") or "").strip()
-        alat, alon = msg.get("#1#latitude", default=None), msg.get("#1#longitude", default=None)
-        distance = np.inf
-        if alat is not None and alon is not None:
-            distance = degrees_apart(lat, lon, alat, alon)
-        storms.append((i, label, distance))
-
-    named = [s for s in storms if s[1].upper() == name.upper()]
-    near = [s for s in named if s[2] <= MATCH_DISTANCE]
-    if near:
-        return [s[0] for s in near], "by name"
-    closest = min(storms, key=lambda s: s[2], default=None)
-    if closest and closest[2] <= MATCH_DISTANCE:
-        return [closest[0]], f"as {closest[1]}, {closest[2]:.1f}° from the observed centre"
-    if named:
-        print(f"warning: {name} in the forecast is far from the observed centre")
-        return [s[0] for s in named], "by name only"
-    return [], ""
-
-
-# ---------------------------------------------------------------------------
-# 3. Forecast tracks (as in the notebook)
-# ---------------------------------------------------------------------------
-
-COLUMNS = ("stormIdentifier", "longStormName", "ensembleMemberNumber",
-           "ensembleForecastType", "latitude", "longitude",
-           "pressureReducedToMeanSeaLevel")
-
-
-def feature_frame(storm, significance, columns=COLUMNS):
-    """One significance branch of a storm message, as a dataframe."""
-    return storm.to_pandas(columns=columns,
-                           filters={"meteorologicalAttributeSignificance": significance},
-                           required_columns=False)
-
-
-def centre_track(storm):
-    """Storm-centre track of every member, with the lead time in hours."""
-    df = feature_frame(storm, CENTRE)
-    df["step"] = df.groupby("ensembleMemberNumber").cumcount() * STEP_HOURS
-
-    start = (feature_frame(storm, PERTURBED_ANALYSIS)
-             .drop_duplicates(subset="ensembleMemberNumber")
-             .set_index("ensembleMemberNumber"))
-    first = df.step == 0
-    for column in ("latitude", "longitude", "pressureReducedToMeanSeaLevel"):
-        own = df.loc[first, "ensembleMemberNumber"].map(start[column])
-        df.loc[first, column] = own.where(own.notna(), df.loc[first, column])
-    return df
-
-
-def wind_track(storm):
-    """Maximum 10 m wind of every member, with the lead time in hours."""
-    df = feature_frame(storm, MAXWIND,
-                       ("ensembleMemberNumber", "ensembleForecastType", "latitude",
-                        "longitude", "windSpeedAt10M"))
-    df["step"] = df.groupby("ensembleMemberNumber").cumcount() * STEP_HOURS
-    return df
-
-
-def member_of(df, forecast_type):
-    """Member number carrying one ensembleForecastType, or None if the run has none."""
-    members = df.loc[df.ensembleForecastType == forecast_type, "ensembleMemberNumber"]
-    return int(members.iloc[0]) if len(members) else None
-
-
-# ---------------------------------------------------------------------------
-# 4. The plots
-# ---------------------------------------------------------------------------
-
-BAND_HOURS = 24   # one colour per 24 hours of lead time
-COLOURS = ["black", "red", "green", "orange", "navy",             # 0-120 h
-           "limegreen", "darkred", "cyan", "magenta", "grey"]     # 120-240 h
-
-
-def track_extent(df, pad=3):
-    """Map extent around a set of positions, with a margin of pad degrees."""
-    return [df.longitude.min() - pad, df.longitude.max() + pad,
-            df.latitude.min() - pad, df.latitude.max() + pad]
-
-
-def reporting_interval(df):
-    """The usual spacing between reported positions, in hours."""
-    gaps = []
-    for _, track in df.groupby("ensembleMemberNumber"):
-        reported = track.dropna(subset=["latitude", "longitude"])["step"].to_numpy()
-        gaps += np.diff(reported).tolist()
-    gaps = np.array([g for g in gaps if g > 0], dtype=int)
-    return int(np.bincount(gaps).argmax()) if gaps.size else STEP_HOURS
-
-
-def track_segments(track, max_gap_hours):
-    """Segments between reported positions no more than max_gap_hours apart."""
-    reported = track.dropna(subset=["latitude", "longitude"])
-    if len(reported) < 2:
-        return np.empty((0, 2, 2)), np.empty(0, dtype=int)
-    steps = reported["step"].to_numpy()
-    points = reported[["longitude", "latitude"]].to_numpy(dtype=float)
-    keep = np.diff(steps) <= max_gap_hours
-    segments = np.stack([points[:-1], points[1:]], axis=1)
-    return segments[keep], steps[:-1][keep].astype(int)
-
-
-def track_map(centre, base, positions, title, max_hours):
-    """Ensemble track plumes coloured by lead time, with the observed positions."""
-    df = centre[centre.step <= max_hours]     # missing positions are kept, so gaps stay open
-    hres, control = member_of(df, HRES), member_of(df, CONTROL)
-
-    # Longitudes are made continuous around the observed centre at the base time, so a
-    # storm crossing the date line is drawn in one piece (-179 and 179 -> 181 and 179).
-    central = float(positions.LON.iloc[0]) if len(positions) else float(df.longitude.median())
-    unwrap = lambda lon: (lon - central + 180) % 360 - 180 + central
-    df = df.assign(longitude=unwrap(df.longitude))
-    positions = positions.assign(LON=unwrap(positions.LON))
-    plate = ccrs.PlateCarree()
-
-    ax = plt.figure(figsize=(11, 9)).add_subplot(projection=ccrs.PlateCarree(central))
-    ax.add_feature(cfeature.LAND, facecolor="wheat")
-    ax.coastlines("50m", linewidth=0.6)
-
-    interval = reporting_interval(df)   # 6 h in modern files, 12 h in older ones
-    for member, track in df.groupby("ensembleMemberNumber"):
-        segments, starts = track_segments(track, interval)
-        if not len(segments):
-            continue
-        bands = starts // BAND_HOURS
-        if member in (hres, control):
-            style = dict(colors=["cyan" if b == 0 else "black" for b in bands],
-                         linewidths=2.5, zorder=6 if member == hres else 5)
-            if member == control:
-                style["linestyles"] = ":"
-        else:
-            style = dict(colors=[COLOURS[b % len(COLOURS)] for b in bands],
-                         linewidths=0.9, zorder=3)
-        ax.add_collection(LineCollection(segments, transform=plate, **style))
-
-    if len(positions):
-        ax.plot(positions.LON, positions.LAT, color="red", linewidth=1.2, transform=plate, #CHANGE OBS COLOR HERE
-                zorder=7)
-        ax.plot(positions.LON, positions.LAT, linestyle="none", marker="o", color="red",   #CHANGE OBS COLOR HERE
-                markersize=6, markeredgecolor="white", markeredgewidth=0.8,
-                transform=plate, zorder=8)
-
-    shown = pd.concat([df[["longitude", "latitude"]],
-                       positions[["LON", "LAT"]].set_axis(["longitude", "latitude"], axis=1)])
-    west, east, south, north = track_extent(shown.dropna())
-    # in the map's own coordinates, centred on the storm, so the date line is no edge
-    ax.set_extent([west - central, east - central, south, north], crs=ax.projection)
-    every = 10 if east - west > 30 else 5      # a gridline every 5 or 10 degrees
-    grid = ax.gridlines(draw_labels=True, linewidth=0.5, color="grey", linestyle=":",
-                        xlocs=MultipleLocator(every), ylocs=MultipleLocator(every))
-    grid.top_labels = grid.right_labels = False
-
-    last = int(df.step.max())
-    key = [Line2D([], [], color=COLOURS[b % len(COLOURS)], linewidth=2,
-                  label=f"{b * BAND_HOURS}-{(b + 1) * BAND_HOURS} h")
-           for b in range(-(-last // BAND_HOURS))]
-    if hres is not None:
-        key.append(Line2D([], [], color="black", linewidth=2.5,
-                          label=f"high-resolution forecast ({hres})"))
-    if control is not None:
-        key.append(Line2D([], [], color="black", linewidth=2.5, linestyle=":",
-                          label=f"low-resolution control ({control})"))
-    if len(positions):
-        key.append(Line2D([], [], color="red", linewidth=1.2, marker="o", markersize=6,    #CHANGE OBS COLOR HERE
-                          markeredgecolor="white", label="observed (IBTrACS), 6-hourly"))
-    ax.legend(handles=key, title="lead time", fontsize=9, frameon=False,
-              loc="upper left", bbox_to_anchor=(1.02, 1))
-    ax.set_title(title)
-    return ax.figure
-
-
-def intensity_panels(centre, wind, base, obs, obs_label, title, max_hours):
-    """Wind and pressure spread of the ensemble, with the observation at every step."""
-    valid = lambda s: base + timedelta(hours=int(s))
-    centre = centre[centre.step <= max_hours].assign(
-        mslp=lambda d: d.pressureReducedToMeanSeaLevel / 100)
-    wind = wind[wind.step <= max_hours].assign(kt=lambda d: d.windSpeedAt10M * MS_TO_KT)
-    steps = sorted(centre.step.unique())
-    times = [valid(s) for s in steps]
-    observed = obs.reindex(times)          # observations at the forecast valid times only
-
-    # The spread is the ensemble: the perturbed members plus the low-resolution
-    # control. The high-resolution forecast is drawn on top, not counted in the boxes.
-    hres_no = member_of(centre, HRES)
-    ens_centre = centre[centre.ensembleMemberNumber != hres_no]
-    ens_wind = wind[wind.ensembleMemberNumber != hres_no]
-
-    fig, axes = plt.subplots(2, 1, figsize=(13, 8.5), sharex=True, layout="constrained")
-
-    box = dict(patch_artist=True, showfliers=False, whis=(0, 100), widths=0.16,
-               boxprops=dict(facecolor="paleturquoise", edgecolor="navy", linewidth=0.6),
-               medianprops=dict(color="navy"),
-               whiskerprops=dict(color="navy", linewidth=0.6),
-               capprops=dict(color="navy", linewidth=0.6))
-
-    for ax, df, ens, column, obs_column, ylabel in (
-            (axes[0], wind, ens_wind, "kt", "wind", "10 m wind speed (kt)"),
-            (axes[1], centre, ens_centre, "mslp", "mslp", "mean sea level pressure (hPa)")):
-        ax.boxplot([ens.loc[ens.step == s, column].dropna() for s in steps],
-                   positions=mdates.date2num(times), **box)
-        for forecast_type, style, label in (
-                (HRES, dict(linestyle="-", linewidth=1.8), "high-resolution forecast"),
-                (CONTROL, dict(linestyle=":", linewidth=1.8), "low-resolution control")):
-            number = member_of(df, forecast_type)
-            if number is None:
-                continue
-            track = df[df.ensembleMemberNumber == number]
-            ax.plot([valid(s) for s in track.step], track[column],
-                    color="black", label=label, **style)
-        ax.plot(times, [ens.loc[ens.step == s, column].mean() for s in steps],
-                color="dimgrey", linestyle="--", linewidth=1.4, label="ensemble mean")
-        seen = observed[obs_column].dropna()
-        if len(seen):
-            ax.plot(seen.index, seen, color="red", linewidth=1, alpha=0.6, zorder=6)     #CHANGE OBS COLOR HERE
-            ax.plot(seen.index, seen, linestyle="none", marker="*", color="red",         #CHANGE OBS COLOR HERE
-                    markersize=12, zorder=7, label=f"observed ({obs_label})")
-        ax.set_ylabel(ylabel)
-        ax.yaxis.set_major_locator(MultipleLocator(10))     # same tick step as the operational chart
-        ax.grid(axis="y", linewidth=0.3, alpha=0.5)
-        ax.xaxis.set_major_locator(mdates.DayLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %d %b"))
-        ax.set_xlim(times[0] - timedelta(hours=6), times[-1] + timedelta(hours=6))
-
-    # one legend for both panels, below them, so it never hides the boxes; an entry
-    # may be in one panel only (e.g. a storm with observed pressure but no wind)
-    entries = {}
-    for ax in axes:
-        for handle, label in zip(*ax.get_legend_handles_labels()):
-            entries.setdefault(label, handle)
-    fig.suptitle(title, fontsize=12)
-    fig.legend(entries.values(), entries.keys(), loc="outside lower center",
-               ncol=len(entries), fontsize=9, frameon=False)
-    return fig
 
 
 def forecast_storm(base, track):
@@ -598,64 +106,20 @@ def forecast_storm(base, track):
     return fl[found]
 
 
-def make_plots(storm, track, base, obs, obs_label, max_hours=240):
-    """The meteogram and the plume map of one run, as two matplotlib figures."""
-    name, sid = track.NAME.iloc[0], "+".join(track.SID.unique())
-    centre = centre_track(storm)
-    hours = min(run_hours(base), max_hours)
-    title = (f"{name} ({sid}) — ECMWF ensemble, base time {base:%Y-%m-%d %H} UTC, "
-             f"against IBTrACS observations")
-    meteogram = intensity_panels(centre, wind_track(storm), base, obs, obs_label,
-                                 title, hours)
-
-    # observed positions at the forecast valid times, so dots and forecast steps line up
-    steps = [base + timedelta(hours=h) for h in range(0, hours + 1, STEP_HOURS)]
-    positions = track[track.time.isin(steps)].dropna(subset=["LAT", "LON"])
-    plumes = track_map(centre, base, positions,
-                       f"{name} ({sid}) — ECMWF ensemble tracks and IBTrACS positions\n"
-                       f"base time {base:%Y-%m-%d %H} UTC", hours)
-    return meteogram, plumes
-
-
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Plot ECMWF ensemble wind and pressure meteograms for a tropical "
-                    "cyclone, verified against IBTrACS observations.")
-    parser.add_argument("storm", help="storm name (e.g. GARANCE) or IBTrACS SID")
-    parser.add_argument("--max-hours", type=int, default=240,
-                        help="last forecast step to plot (default 240)")
-    parser.add_argument("--outdir", type=Path, default=PLOT_DIR,
-                        help=f"where to save the plots (default: {PLOT_DIR})")
-    parser.add_argument("--no-show", action="store_true",
-                        help="save the plots without showing them")
-    args = parser.parse_args()
-
+    args = command_line("Plot ECMWF ensemble wind and pressure meteograms for a tropical "
+                        "cyclone, verified against IBTrACS observations, with the "
+                        "forecasts from S3.", "GARANCE")
     try:
-        ibtracs = read_ibtracs(download_ibtracs())
-        track = choose_storm(ibtracs, args.storm)
-        obs, obs_label = observed_intensity(track)
-        bases = candidate_runs(track, obs)
-        base = choose_run(bases, obs, first_landfall(track), args.max_hours)
+        track, obs, obs_label = observations(args)
+        base = pick_run(args, track, obs, candidate_runs(track, obs))
         storm = forecast_storm(base, track)
     except TrackverError as error:
         sys.exit(f"trackver: {error}")
-    meteogram, plumes = make_plots(storm, track, base, obs, obs_label, args.max_hours)
-    name = track.NAME.iloc[0]
-
-    args.outdir.mkdir(parents=True, exist_ok=True)
-    label = re.sub(r"[^A-Za-z0-9-]+", "_", name)
-    for kind, fig in (("meteogram", meteogram), ("plumes", plumes)):
-        out = args.outdir / f"ver_{kind}_{label}_{base:%Y%m%d%H}.png"
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"Saved {out}")
-
-    if args.no_show or matplotlib.get_backend().lower() == "agg":
-        if not args.no_show:
-            print("(no display available, so the plots are only saved)")
-        return
-    plt.show()
+    figures = make_plots(storm, track, base, obs, obs_label, args.max_hours)
+    save_and_show({"": figures}, track, base, args)
 
 
 if __name__ == "__main__":

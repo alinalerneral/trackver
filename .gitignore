@@ -1,7 +1,10 @@
-# IBTrACS CSV downloaded by trackver (about 10 MB, refreshed on every run)
+# IBTrACS CSV downloaded by trackver and trackver_mars (about 10 MB, refreshed on every run)
 obs/
 
-# plots written by trackver
+# BUFR track files retrieved from MARS by trackver_mars, with their requests and logs
+forecasts/
+
+# plots written by trackver and trackver_mars
 plots/
 
 __pycache__/
